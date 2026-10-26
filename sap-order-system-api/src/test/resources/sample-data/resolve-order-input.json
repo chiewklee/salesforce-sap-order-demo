@@ -1,0 +1,17 @@
+{
+  "poNumber": "SF-00000210",
+  "soldTo": "0000099999",
+  "items": [
+    {
+      "itemNo": "000010",
+      "material": "B-7000",
+      "plant": "1000",
+      "quantity": "10",
+      "unit": "ST",
+      "customerMaterial": "SKU-1001 Sample Product A"
+    },
+    {
+      "quantity": "3"
+    }
+  ]
+}

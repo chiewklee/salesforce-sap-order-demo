@@ -1,0 +1,47 @@
+http:
+  port: "8071"
+
+# ===== Downstream System API (sap-order-system-api) =====
+# Synchronous call: intake -> System API -> SAP.
+# LOCAL: HTTP to localhost:8091 (both apps in one standalone runtime).
+# CH2.0: override to HTTPS / 443 / the System API's public host via the
+#        cloudhub2Deployment <properties> (see pom + DEPLOY-CH2.md).
+systemApi:
+  # CloudHub 2.0: call the System API over its public HTTPS URL.
+  # For LOCAL dev, revert to: protocol HTTP / host localhost / port 8091.
+  protocol: "HTTPS"
+  # host: set in secrets.yaml
+  port: "443"
+  path: "/api/salesorders"
+
+# ===== Salesforce (CDC subscription + SOQL enrich + write-back) =====
+# Basic Auth: username + password (+ optional security token, blank when the
+# Mule host's IP is trusted by the org).
+# Credentials live in secrets.yaml. PRODUCTION: use secure properties instead.
+sfdc:
+  # username / password: set in secrets.yaml (gitignored)
+  # Full SOAP login endpoint incl. API version (the connector parses the
+  # version from this string; the trailing /NN.0 is required).
+  # MUST be <= 64.0: Basic Auth (username/password SOAP login) is not
+  # available at v65+ ("SOAP Login operation is not available in the API
+  # version specified"). v64 subscribes to /data/OrderChangeEvent fine
+  # (the connector's "recommended 66" warning is benign).
+  loginUrl: "https://login.salesforce.com/services/Soap/u/64.0"
+  # Change Data Capture channel for the Order object (enable in Setup > Change
+  # Data Capture, select "Orders"). CDC delivers header-field changes; line
+  # items are queried back in the flow.
+  cdcChannel: "/data/OrderChangeEvent"
+
+# ===== Salesforce line -> SAP line mapping =====
+sapMapping:
+  # SAP material to order for every Salesforce product. The MuleSoft internal
+  # demo SAP can only sell B-7000, so the demo maps everything to it and keeps
+  # the real ProductCode + name in SAP's Customer Material Number (CUST_MAT35).
+  # Set to "" to send each product's own ProductCode as the SAP material.
+  material: "B-7000"
+  # Product codes with this prefix are sent to SAP unchanged, so a product such
+  # as "ZZ-INVALID" makes SAP reject the order (the rejection demo).
+  # Set to "" to turn this off.
+  passthroughPrefix: "ZZ-"
+  unit: "ST"
+  plant: "1000"

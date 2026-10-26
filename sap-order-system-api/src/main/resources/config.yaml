@@ -1,0 +1,31 @@
+# Non-secret settings. SAP host, user and password live in secrets.yaml
+# (gitignored; start from secrets.example.yaml). On CloudHub 2.0, sap.password
+# is also set as a secure property at deploy time (see the pom).
+sap:
+  systemNumber: "00"
+  client: "800"
+  language: "EN"
+
+http:
+  port: "8091"
+
+# Defaults for POST /api/salesorders when the request leaves a field out.
+# These values suit the MuleSoft internal demo SAP (an IDES-style system).
+# Change them to match your SAP system's master data.
+orderDefaults:
+  docType: "TA"            # sales document type (standard order)
+  salesOrg: "1000"
+  distrChannel: "10"
+  division: "00"
+  soldTo: "0000099999"     # sold-to customer number
+  poNumber: "DEMO-PO-001"
+  # Dates (YYYYMMDD) are pinned to FY1998, the fiscal year the demo system's
+  # controlling plan supports. Use current dates on a normal system.
+  docDate: "19980605"
+  priceDate: "19980605"
+  reqDeliveryDate: "19980609"
+  # Line item defaults
+  material: "B-7000"
+  plant: "1000"
+  quantity: "1"
+  unit: "ST"

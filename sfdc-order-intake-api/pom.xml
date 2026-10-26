@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example.demo</groupId>
+    <artifactId>sfdc-order-intake-api</artifactId>
+    <version>1.0.1</version>
+    <packaging>mule-application</packaging>
+    <name>sfdc-order-intake-api</name>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <app.runtime>4.11.2</app.runtime>
+        <mule.maven.plugin.version>4.8.0</mule.maven.plugin.version>
+
+        <!-- ===== CloudHub 2.0 deploy parameters (override at deploy: -Danypoint.*) =====
+             Deploy AFTER the System API, then set systemapi.host to its public host:
+               mvn -Pch2 clean deploy -DmuleDeploy \
+                 -Danypoint.client.id=xxxx -Danypoint.client.secret=yyyy \
+                 -Danypoint.env=Sandbox \
+                 -Dsystemapi.host=sap-order-system-api-XXXX.<zone>.usa-e1.cloudhub.io -->
+        <anypoint.env>Sandbox</anypoint.env>
+        <anypoint.bg>SET_AT_DEPLOY</anypoint.bg>
+        <anypoint.client.id>SET_AT_DEPLOY</anypoint.client.id>
+        <anypoint.client.secret>SET_AT_DEPLOY</anypoint.client.secret>
+        <ch2.target>Cloudhub-US-East-1</ch2.target>
+        <ch2.replicas>1</ch2.replicas>
+        <ch2.vcores>0.1</ch2.vcores>
+        <!-- Public host of the deployed System API (no scheme, no path) -->
+        <systemapi.host>SET_AT_DEPLOY</systemapi.host>
+    </properties>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.mule.tools.maven</groupId>
+                <artifactId>mule-maven-plugin</artifactId>
+                <version>${mule.maven.plugin.version}</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <!-- ===== CloudHub 2.0 deployment (shared space, us-east-1) ===== -->
+                    <cloudhub2Deployment>
+                        <uri>https://anypoint.mulesoft.com</uri>
+                        <provider>MC</provider>
+                        <environment>${anypoint.env}</environment>
+                        <businessGroupId>${anypoint.bg}</businessGroupId>
+                        <target>${ch2.target}</target>
+                        <muleVersion>${app.runtime}</muleVersion>
+                        <applicationName>sfdc-order-intake-api</applicationName>
+                        <connectedAppClientId>${anypoint.client.id}</connectedAppClientId>
+                        <connectedAppClientSecret>${anypoint.client.secret}</connectedAppClientSecret>
+                        <connectedAppGrantType>client_credentials</connectedAppGrantType>
+                        <replicas>${ch2.replicas}</replicas>
+                        <vCores>${ch2.vcores}</vCores>
+                        <javaVersion>17</javaVersion>
+                        <deploymentSettings>
+                            <generateDefaultPublicUrl>true</generateDefaultPublicUrl>
+                        </deploymentSettings>
+                        <!-- CH2.0 container listens on 8081; call the System API over
+                             public HTTPS on 443. -->
+                        <properties>
+                            <http.port>8081</http.port>
+                            <systemApi.protocol>HTTPS</systemApi.protocol>
+                            <systemApi.host>${systemapi.host}</systemApi.host>
+                            <systemApi.port>443</systemApi.port>
+                            <systemApi.path>/api/salesorders</systemApi.path>
+                        </properties>
+                    </cloudhub2Deployment>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.mule.connectors</groupId>
+            <artifactId>mule-http-connector</artifactId>
+            <version>1.11.1</version>
+            <classifier>mule-plugin</classifier>
+        </dependency>
+        <!-- Salesforce connector: CDC subscription (OrderChangeEvent) + query/update write-back.
+             11.x targets Mule 4.6+/Java 17; replay persistence uses the runtime's built-in
+             object store (no external Object Store connector needed). -->
+        <dependency>
+            <groupId>com.mulesoft.connectors</groupId>
+            <artifactId>mule-salesforce-connector</artifactId>
+            <version>11.4.0</version>
+            <classifier>mule-plugin</classifier>
+        </dependency>
+    </dependencies>
+
+    <repositories>
+        <repository>
+            <id>MuleRepository</id>
+            <name>MuleSoft Enterprise Repository</name>
+            <url>https://repository.mulesoft.org/nexus-ee/content/repositories/releases-ee/</url>
+            <layout>default</layout>
+        </repository>
+        <repository>
+            <id>anypoint-exchange-v3</id>
+            <name>Anypoint Exchange</name>
+            <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>
+            <layout>default</layout>
+        </repository>
+        <repository>
+            <id>mulesoft-releases</id>
+            <name>MuleSoft Releases Repository</name>
+            <url>https://repository.mulesoft.org/releases/</url>
+            <layout>default</layout>
+        </repository>
+    </repositories>
+    <pluginRepositories>
+        <pluginRepository>
+            <id>mulesoft-releases</id>
+            <name>MuleSoft Releases Repository</name>
+            <url>https://repository.mulesoft.org/releases/</url>
+            <layout>default</layout>
+            <snapshots><enabled>false</enabled></snapshots>
+        </pluginRepository>
+    </pluginRepositories>
+</project>

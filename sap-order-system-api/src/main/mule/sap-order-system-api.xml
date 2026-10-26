@@ -1,0 +1,370 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:sap="http://www.mulesoft.org/schema/mule/sap"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/sap http://www.mulesoft.org/schema/mule/sap/current/mule-sap.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- Credentials + SAP host (gitignored; copy secrets.example.yaml) -->
+    <configuration-properties file="secrets.yaml"/>
+
+    <!-- ============================================================
+         APP 3 — SAP Order System API
+         Role: the ONLY app that talks to SAP. Encapsulates the core order flow:
+         validate a sales order (BAPI TESTRUN) then create+commit it
+         (BAPI create + BAPI_TRANSACTION_COMMIT). Exposes a clean REST
+         contract so callers (App2 process API, or any synchronous client)
+         never see JCo/BAPI details.
+
+           GET  /ping                     — SAP connectivity (RFC_PING)
+           GET  /api/salesorders/{id}     — read order status (BAPI GETSTATUS)
+           POST /api/salesorders          — validate-then-create
+
+         A SAP connectivity/timeout failure is surfaced as HTTP 503 so the
+         caller's circuit breaker can distinguish "SAP is down" (retry) from
+         "order rejected" (422, do not retry).
+         ============================================================ -->
+
+    <!-- ===== SAP ECC connection (application-server / simple connection) ===== -->
+    <sap:sap-config name="SAP_Config" doc:name="SAP ECC">
+        <sap:simple-connection-provider-connection
+            applicationServerHost="${sap.applicationServerHost}"
+            systemNumber="${sap.systemNumber}"
+            client="${sap.client}"
+            username="${sap.user}"
+            password="${sap.password}"
+            language="${sap.language}"/>
+    </sap:sap-config>
+
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- ===== Connectivity test: GET /ping -> SAP RFC_PING ===== -->
+    <flow name="sap-ping-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/ping" allowedMethods="GET" doc:name="GET /ping"/>
+        <set-payload value='#[%dw 2.0 output application/xml --- { RFC_PING: {} }]' doc:name="RFC_PING request"/>
+        <sap:synchronous-remote-function-call config-ref="SAP_Config"
+            key="RFC_PING" doc:name="SAP RFC_PING"/>
+        <logger level="INFO" message="SAP ECC RFC_PING succeeded" doc:name="log OK"/>
+        <set-payload value='#[%dw 2.0 output application/json --- { app: "sap-order-system-api", status: "OK", message: "SAP ECC connection verified via RFC_PING", host: p("sap.applicationServerHost"), client: p("sap.client") }]' doc:name="OK response"/>
+    </flow>
+
+    <!-- =====================================================================
+         Query a Sales Order from SAP (synchronous BAPI read)
+         GET /api/salesorders/{id}   e.g. /api/salesorders/125640
+         Uses BAPI_SALESORDER_GETSTATUS (RFC-enabled) — header + item status.
+         VBELN is zero-padded to 10 chars for the ALPHA exit.
+         ===================================================================== -->
+    <flow name="get-salesorder-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/api/salesorders/{salesDoc}" allowedMethods="GET" doc:name="GET /api/salesorders/{id}"/>
+
+        <!-- Keep the doc number: the SAP call below replaces attributes (and uriParams). -->
+        <set-variable variableName="salesDoc" value="#[attributes.uriParams.salesDoc]" doc:name="salesDoc"/>
+
+        <ee:transform doc:name="Build GETSTATUS request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+{
+    BAPI_SALESORDER_GETSTATUS: {
+        "import": {
+            SALESDOCUMENT: (vars.salesDoc as Number) as String { format: "0000000000" }
+        }
+    }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <sap:synchronous-remote-function-call config-ref="SAP_Config"
+            key="BAPI_SALESORDER_GETSTATUS" doc:name="Get Sales Order status (BAPI)"/>
+
+        <ee:transform doc:name="JSON response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json skipNullOn = "everywhere"
+var r = payload.BAPI_SALESORDER_GETSTATUS
+---
+{
+    salesDocument: vars.salesDoc,
+    mechanism: "BAPI (synchronous) — BAPI_SALESORDER_GETSTATUS",
+    statusInfo: (r.tables.STATUSINFO.*row default []),
+    messages:   (r.tables.RETURN.*row default []) map {
+        messageType: $.TYPE default "",
+        message:     $.MESSAGE default ""
+    }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- =====================================================================
+         Core flow — POST /api/salesorders : validate-then-submit to SAP.
+         Body = order JSON (all fields optional; demo-safe defaults applied).
+         Returns 201 (created, with salesDocument) or 422 (rejected).
+
+           STEP 1 VALIDATE — BAPI_SALESORDER_CREATEFROMDAT2 with TESTRUN='X'
+                  (all SAP checks, no DB change; any E/A message stops here).
+           STEP 2 SUBMIT   — BAPI_SALESORDER_CREATEFROMDAT2 (real) + BAPI_
+                  TRANSACTION_COMMIT in ONE transactional <try> (shared stateful
+                  JCo session, required for the LUW to persist).
+         SAP connectivity/timeout → 503 (handled below) so the caller retries.
+         ===================================================================== -->
+    <flow name="create-salesorder-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/api/salesorders" allowedMethods="POST" doc:name="POST /api/salesorders">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+            <http:error-response statusCode="#[vars.httpStatus default 503]">
+                <http:body>#[output application/json --- (vars.errorBody default { error: "SAP_UNAVAILABLE" })]</http:body>
+            </http:error-response>
+        </http:listener>
+
+        <!-- Resolve the order payload once (defaults applied). items stays an
+             array here (safe); repeated SAP <row> elements are generated only at
+             XML-output time in the builders below, never round-tripped as Java. -->
+        <ee:transform doc:name="Resolve order input">
+            <ee:variables>
+                <ee:set-variable variableName="order"><![CDATA[%dw 2.0
+output application/java
+var o = payload default {}
+// Defaults come from config.yaml (orderDefaults.*) so another SAP system only
+// needs settings changes. Any field in the request body overrides them.
+fun d(key) = p("orderDefaults." ++ key)
+var reqDelivery = o.reqDeliveryDate default d("reqDeliveryDate")
+var raw = (o.items default [])
+var items = if (isEmpty(raw)) [{}] else raw
+---
+{
+    docType: (o.docType default d("docType")),
+    salesOrg: (o.salesOrg default d("salesOrg")),
+    distrChannel: (o.distrChannel default d("distrChannel")),
+    division: (o.division default d("division")),
+    poNumber: (o.poNumber default d("poNumber")),
+    docDate: (o.docDate default d("docDate")),
+    priceDate: (o.priceDate default d("priceDate")),
+    reqDeliveryDate: reqDelivery,
+    soldTo: (o.soldTo default d("soldTo")) as String,
+    items: (items map (it, i) -> {
+        itemNo: (it.itemNo default (((i + 1) * 10) as String { format: "000000" })),
+        material: (it.material default d("material")),
+        plant: (it.plant default d("plant")),
+        quantity: (it.quantity default d("quantity")) as String,
+        unit: (it.unit default d("unit")),
+        reqDate: (it.reqDate default reqDelivery),
+        // Customer's own material identifier (SAP CUST_MAT35 -> "Customer
+        // Material Numb" column, KDMAT). This is a pure passthrough field, so
+        // it displays the caller's product code even when the ordered material
+        // is the demo-safe B-7000. Capped at 35 chars. Blank -> left empty.
+        customerMaterial: ((it.customerMaterial default "") as String)[0 to 34] default ""
+    })
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <try doc:name="SAP interaction (surfaces availability failures as 503)">
+
+            <!-- ===== STEP 1 — VALIDATE (BAPI TESTRUN='X', no database change) ===== -->
+            <ee:transform doc:name="Build request (TESTRUN)">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+var ord = vars.order
+---
+{
+    BAPI_SALESORDER_CREATEFROMDAT2: {
+        "import": {
+            ORDER_HEADER_IN: {
+                DOC_TYPE: ord.docType, SALES_ORG: ord.salesOrg,
+                DISTR_CHAN: ord.distrChannel, DIVISION: ord.division,
+                PURCH_NO_C: ord.poNumber, DOC_DATE: ord.docDate,
+                PRICE_DATE: ord.priceDate, REQ_DATE_H: ord.reqDeliveryDate
+            },
+            TESTRUN: "X"
+        },
+        tables: {
+            ORDER_PARTNERS: { row: { PARTN_ROLE: "AG", PARTN_NUMB: ord.soldTo } },
+            ORDER_ITEMS_IN: { (ord.items map (it) -> { row: {
+                ITM_NUMBER: it.itemNo, MATERIAL: it.material, PLANT: it.plant,
+                TARGET_QTY: it.quantity, TARGET_QU: it.unit,
+                (CUST_MAT35: it.customerMaterial) if ((it.customerMaterial default "") != "") } }) },
+            // CREATEFROMDAT2 ignores optional item fields (e.g. CUST_MAT35) unless
+            // they're flagged 'X' here with UPDATEFLAG 'I'. Structural fields are
+            // flagged too so behaviour is unchanged for the fields already working.
+            ORDER_ITEMS_INX: { (ord.items map (it) -> { row: {
+                ITM_NUMBER: it.itemNo, UPDATEFLAG: "I",
+                MATERIAL: "X", PLANT: "X", TARGET_QTY: "X", TARGET_QU: "X",
+                (CUST_MAT35: "X") if ((it.customerMaterial default "") != "") } }) },
+            ORDER_SCHEDULES_IN: { (ord.items map (it) -> { row: {
+                ITM_NUMBER: it.itemNo, REQ_DATE: it.reqDate, REQ_QTY: it.quantity } }) }
+        }
+    }
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <sap:synchronous-remote-function-call config-ref="SAP_Config"
+                key="BAPI_SALESORDER_CREATEFROMDAT2" doc:name="Validate Sales Order (BAPI TESTRUN)"/>
+            <ee:transform doc:name="Normalize validation">
+                <ee:variables>
+                    <ee:set-variable variableName="validation"><![CDATA[%dw 2.0
+output application/java
+var msgs = (payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.RETURN.*row default []) map {
+    messageType: ($.TYPE default "") as String,
+    id:          ($.ID default "") as String,
+    number:      ($.NUMBER default "") as String,
+    message:     ($.MESSAGE default "") as String
+}
+---
+{
+    hasError: !isEmpty(msgs filter ((m) -> m.messageType == "E" or m.messageType == "A")),
+    messages: msgs
+}]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <choice doc:name="Validation passed?">
+                <when expression="#[vars.validation.hasError]">
+                    <!-- Validation failed — do NOT submit -->
+                    <set-variable variableName="httpStatus" value="#[422]" doc:name="422 Unprocessable"/>
+                    <logger level="WARN" message='#["Order failed SAP validation — not submitted: " ++ write(vars.validation.messages, "application/json")]' doc:name="log validation fail"/>
+                    <ee:transform doc:name="Validation-failed response">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    validated: false,
+    submitted: false,
+    salesDocument: "",
+    mechanism: "Validate: BAPI_SALESORDER_CREATEFROMDAT2 (TESTRUN='X') — rejected before submit",
+    validationMessages: vars.validation.messages,
+    submissionMessages: []
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </when>
+                <otherwise>
+                    <!-- ===== STEP 2 — SUBMIT (real create + COMMIT, one stateful session) ===== -->
+                    <ee:transform doc:name="Build request (post)">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+var ord = vars.order
+---
+{
+    BAPI_SALESORDER_CREATEFROMDAT2: {
+        "import": {
+            ORDER_HEADER_IN: {
+                DOC_TYPE: ord.docType, SALES_ORG: ord.salesOrg,
+                DISTR_CHAN: ord.distrChannel, DIVISION: ord.division,
+                PURCH_NO_C: ord.poNumber, DOC_DATE: ord.docDate,
+                PRICE_DATE: ord.priceDate, REQ_DATE_H: ord.reqDeliveryDate
+            }
+        },
+        tables: {
+            ORDER_PARTNERS: { row: { PARTN_ROLE: "AG", PARTN_NUMB: ord.soldTo } },
+            ORDER_ITEMS_IN: { (ord.items map (it) -> { row: {
+                ITM_NUMBER: it.itemNo, MATERIAL: it.material, PLANT: it.plant,
+                TARGET_QTY: it.quantity, TARGET_QU: it.unit,
+                (CUST_MAT35: it.customerMaterial) if ((it.customerMaterial default "") != "") } }) },
+            ORDER_SCHEDULES_IN: { (ord.items map (it) -> { row: {
+                ITM_NUMBER: it.itemNo, REQ_DATE: it.reqDate, REQ_QTY: it.quantity } }) }
+        }
+    }
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+
+                    <try transactionalAction="ALWAYS_BEGIN" doc:name="SAP LUW (stateful session)">
+                        <sap:synchronous-remote-function-call config-ref="SAP_Config"
+                            key="BAPI_SALESORDER_CREATEFROMDAT2" doc:name="Submit Sales Order (BAPI)"/>
+                        <ee:transform doc:name="Normalize submit result">
+                            <ee:variables>
+                                <ee:set-variable variableName="createResult"><![CDATA[%dw 2.0
+output application/java
+var r = payload.BAPI_SALESORDER_CREATEFROMDAT2
+var msgs = (r.tables.RETURN.*row default []) map {
+    messageType: ($.TYPE default "") as String,
+    id:          ($.ID default "") as String,
+    number:      ($.NUMBER default "") as String,
+    message:     ($.MESSAGE default "") as String
+}
+---
+{
+    salesDocument: ((r.export.SALESDOCUMENT default r.SALESDOCUMENT) default "") as String,
+    hasError: !isEmpty(msgs filter ((m) -> m.messageType == "E" or m.messageType == "A")),
+    messages: msgs
+}]]></ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                        <choice doc:name="Committed cleanly?">
+                            <when expression='#[(not vars.createResult.hasError) and (vars.createResult.salesDocument != "")]'>
+                                <set-payload value='#[%dw 2.0 output application/xml --- { BAPI_TRANSACTION_COMMIT: { "import": { WAIT: "X" } } }]' doc:name="COMMIT request"/>
+                                <sap:synchronous-remote-function-call config-ref="SAP_Config"
+                                    key="BAPI_TRANSACTION_COMMIT" doc:name="BAPI_TRANSACTION_COMMIT"/>
+                                <set-variable variableName="committed" value="#[true]" doc:name="committed=true"/>
+                                <logger level="INFO" message='#["Sales order created and committed: " ++ vars.createResult.salesDocument]' doc:name="log created"/>
+                            </when>
+                            <otherwise>
+                                <set-payload value='#[%dw 2.0 output application/xml --- { BAPI_TRANSACTION_ROLLBACK: {} }]' doc:name="ROLLBACK request"/>
+                                <sap:synchronous-remote-function-call config-ref="SAP_Config"
+                                    key="BAPI_TRANSACTION_ROLLBACK" doc:name="BAPI_TRANSACTION_ROLLBACK"/>
+                                <set-variable variableName="committed" value="#[false]" doc:name="committed=false"/>
+                                <logger level="WARN" message='#["Submit failed after passing validation — rolled back: " ++ write(vars.createResult.messages, "application/json")]' doc:name="log rollback"/>
+                            </otherwise>
+                        </choice>
+                    </try>
+
+                    <set-variable variableName="httpStatus"
+                        value='#[if ((vars.committed default false) and (vars.createResult.salesDocument != "")) 201 else 422]' doc:name="set status"/>
+                    <ee:transform doc:name="Submit response">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    validated: true,
+    submitted: (vars.committed default false),
+    salesDocument: vars.createResult.salesDocument,
+    mechanism: "Validate: BAPI_SALESORDER_CREATEFROMDAT2 (TESTRUN='X') -> Submit: BAPI_SALESORDER_CREATEFROMDAT2 + BAPI_TRANSACTION_COMMIT",
+    validationMessages: vars.validation.messages,
+    submissionMessages: vars.createResult.messages
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </otherwise>
+            </choice>
+
+            <!-- ===== SAP availability failure → 503 so the caller's circuit breaker trips.
+                 Business rejections never reach here (they return 422 above). ===== -->
+            <error-handler>
+                <on-error-continue type="SAP:CONNECTIVITY, SAP:TIMEOUT, SAP:RETRY_EXHAUSTED, SAP:SYSTEM_BUSY, ANY" doc:name="SAP unavailable">
+                    <set-variable variableName="httpStatus" value="#[503]" doc:name="503 Service Unavailable"/>
+                    <ee:transform doc:name="SAP-unavailable body">
+                        <ee:variables>
+                            <ee:set-variable variableName="errorBody"><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: "SAP_UNAVAILABLE",
+    errorType: (error.errorType.identifier default "UNKNOWN"),
+    message: (error.description default "SAP ECC could not be reached"),
+    retryable: true
+}]]></ee:set-variable>
+                        </ee:variables>
+                    </ee:transform>
+                    <!-- on-error-continue returns via <http:response>, so the body must be the payload -->
+                    <set-payload value="#[vars.errorBody]" mimeType="application/json" doc:name="503 body"/>
+                    <logger level="ERROR" message='#["[SAP UNAVAILABLE] " ++ (error.description default "")]' doc:name="log sap down"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+</mule>

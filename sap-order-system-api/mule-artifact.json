@@ -1,0 +1,5 @@
+{
+  "name": "sap-order-system-api",
+  "minMuleVersion": "4.11.2",
+  "javaSpecificationVersions": ["17"]
+}

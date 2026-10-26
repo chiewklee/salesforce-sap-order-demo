@@ -1,0 +1,9 @@
+# Allow-list: only these top-level paths are part of the repo.
+/*
+!/.gitignore
+!/README.md
+!/DEPLOY-CH2.md
+!/sap-order-system-api/
+!/sfdc-order-intake-api/
+
+.DS_Store

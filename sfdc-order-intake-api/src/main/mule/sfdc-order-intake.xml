@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- Credentials + System API host (gitignored; copy secrets.example.yaml) -->
+    <configuration-properties file="secrets.yaml"/>
+
+    <!-- ============================================================
+         SFDC Order Intake API (SYNCHRONOUS front door)
+         Role: the endpoint SFDC calls. Forwards the order to the System
+         API, which validates it (BAPI TESTRUN) then creates it in SAP
+         (BAPI create + commit), and returns that result straight back to
+         SFDC in the SAME call:
+           201 -> created, with the SAP sales-document number
+           422 -> rejected by SAP validation (not created)
+           503 -> SAP / System API unavailable
+         No queue, no async — request/response end to end. This app never
+         touches SAP or JCo directly; it only speaks HTTP to the System API.
+         ============================================================ -->
+
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- Client to the System API. Accept ALL status codes so the System
+         API's own 201/422/503 pass through instead of the connector throwing
+         on non-2xx. A genuine transport failure still raises HTTP:CONNECTIVITY. -->
+    <http:request-config name="SystemAPI_Request_config" doc:name="System API">
+        <http:request-connection protocol="${systemApi.protocol}" host="${systemApi.host}" port="${systemApi.port}"/>
+    </http:request-config>
+
+    <!-- ============================================================
+         Salesforce connection (Basic Auth: username + password, no token).
+         Used for BOTH the CDC subscription (OrderChangeEvent) and the
+         SOQL enrich + write-back. The org's Trusted IP Ranges mean the
+         security token is blank. Replay state persists in the runtime's
+         built-in object store (no external Object Store connector). -->
+    <salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config">
+        <salesforce:basic-connection username="${sfdc.username}"
+                                      password="${sfdc.password}"
+                                      securityToken="${sfdc.securityToken}"
+                                      url="${sfdc.loginUrl}"/>
+    </salesforce:sfdc-config>
+
+    <!-- Health check -->
+    <flow name="intake-health-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/health" allowedMethods="GET" doc:name="GET /health"/>
+        <set-payload value='#[%dw 2.0 output application/json --- { app: "sfdc-order-intake-api", status: "UP" }]' doc:name="UP"/>
+    </flow>
+
+    <!-- SFDC -> POST /orders : validate + create synchronously via the System API -->
+    <flow name="accept-order-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/orders" allowedMethods="POST" doc:name="POST /orders (SFDC)">
+            <http:response statusCode="#[vars.apiStatus default 200]"/>
+            <http:error-response statusCode="#[vars.apiStatus default 503]">
+                <http:body>#[output application/json --- (vars.errorBody default { error: "SYSTEM_API_UNAVAILABLE" })]</http:body>
+            </http:error-response>
+        </http:listener>
+
+        <set-variable variableName="trackingId" value="#[uuid()]" doc:name="trackingId"/>
+
+        <try doc:name="Call System API">
+            <http:request config-ref="SystemAPI_Request_config" method="POST" path="${systemApi.path}" doc:name="POST /api/salesorders">
+                <http:body>#[output application/json --- payload]</http:body>
+                <http:headers>#[{ "Content-Type": "application/json" }]</http:headers>
+                <http:response-validator>
+                    <http:success-status-code-validator values="100..599"/>
+                </http:response-validator>
+            </http:request>
+            <set-variable variableName="apiStatus" value="#[attributes.statusCode]" doc:name="apiStatus"/>
+            <logger level="INFO" message='#["[INTAKE] " ++ vars.trackingId ++ " -> System API status " ++ (vars.apiStatus as String)]' doc:name="log result"/>
+
+            <!-- Pass the System API's JSON response back to SFDC, adding the trackingId -->
+            <ee:transform doc:name="Response to SFDC">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload default {}) ++ { trackingId: vars.trackingId }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+            <error-handler>
+                <!-- System API unreachable (transport connectivity/timeout) -> 503 -->
+                <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT, ANY" doc:name="System API unreachable">
+                    <set-variable variableName="apiStatus" value="#[503]" doc:name="503"/>
+                    <ee:transform doc:name="Unavailable body">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: "SYSTEM_API_UNAVAILABLE",
+    message: (error.description default "Could not reach the SAP Order System API"),
+    trackingId: vars.trackingId,
+    retryable: true
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- =====================================================================
+         CDC-DRIVEN INTAKE (event-driven twin of accept-order-flow)
+         Salesforce Order ACTIVATED  ->  OrderChangeEvent (/data/OrderChangeEvent)
+           1. subscribe (replay ONLY_NEW; replay state in built-in object store)
+           2. for any CREATE/UPDATE, SOQL-enrich the Order (header + line items,
+              incl. SAP_Sync_Status__c) then gate: process ONLY when the order is
+              now Status="Activated" AND not yet synced (SAP_Sync_Status__c blank).
+              This means: build the order + line items in Draft, then ACTIVATE to
+              push it to SAP. The gate also breaks the write-back loop — our own
+              write-back sets SAP_Sync_Status__c="Synced", so its UPDATE event is
+              skipped (already synced); it never touches Status.
+           3. map each Salesforce line item -> a SAP line (demo theater: every
+              product maps to the one SAP-valid demo material B-7000, carrying the
+              real quantity; plant/unit/dates come from the System API defaults).
+           4. POST to the System API (validate-then-create in SAP)
+           5. write the SAP result back onto the Order record
+         ===================================================================== -->
+    <!-- maxConcurrency=1: Salesforce emits SEVERAL change events for a single
+         activation (the status PATCH plus cascaded amount/roll-up recalcs).
+         Serializing the flow makes the "already synced" gate an effective
+         idempotency guard — the first event submits to SAP + writes back
+         SAP_Sync_Status__c="Synced", and every later event re-enriches, sees
+         Synced, and skips. Without this the events race (all read a blank
+         status) and create duplicate SAP orders. (In production, back this with
+         an Object Store idempotency key on the record id instead of relying on
+         Salesforce read-after-write.) -->
+    <flow name="cdc-order-created-flow" maxConcurrency="1">
+        <salesforce:replay-channel-listener config-ref="Salesforce_Config"
+                streamingChannel="${sfdc.cdcChannel}" replayOption="ONLY_NEW"
+                doc:name="On new OrderChangeEvent">
+        </salesforce:replay-channel-listener>
+
+        <logger level="INFO" message='#["[CDC] raw event: " ++ write(payload, "application/json")]' doc:name="log raw event"/>
+
+        <!-- Pull changeType + the affected record id out of the ChangeEventHeader,
+             defensively (payload may arrive wrapped under .payload). -->
+        <ee:transform doc:name="Extract ChangeEventHeader">
+            <ee:variables>
+                <ee:set-variable variableName="evt"><![CDATA[%dw 2.0
+output application/java
+// This connector wraps the CDC event as { data: { payload: {...fields, ChangeEventHeader}, event }, channel }.
+// Fall back to other shapes defensively.
+var body = payload.data.payload default (payload.payload default payload)
+var ceh  = body.ChangeEventHeader default {}
+---
+{
+    changeType:  (ceh.changeType default "UNKNOWN") as String,
+    recordId:    ((ceh.recordIds[0]) default (ceh.recordId default "")) as String,
+    entityName:  (ceh.entityName default "Order") as String,
+    // OrderNumber ships in the change event itself — carry it as a fallback
+    // so we can build the SAP PO even if the SOQL enrich returns nothing.
+    orderNumber: (body.OrderNumber default "") as String
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="Order create/update?">
+            <when expression='#[vars.evt.recordId != "" and (vars.evt.changeType == "UPDATE" or vars.evt.changeType == "CREATE")]'>
+
+                <!-- STEP 2 — SOQL enrich: header (incl. SAP_Sync_Status__c) + line items -->
+                <salesforce:query config-ref="Salesforce_Config" doc:name="Query Order + items">
+                    <salesforce:salesforce-query><![CDATA[SELECT Id, OrderNumber, AccountId, EffectiveDate, Status, SAP_Sync_Status__c, (SELECT Product2.ProductCode, Product2.Name, Quantity FROM OrderItems) FROM Order WHERE Id = ':recordId']]></salesforce:salesforce-query>
+                    <salesforce:parameters><![CDATA[#[{ recordId: vars.evt.recordId }]]]></salesforce:parameters>
+                </salesforce:query>
+
+                <set-variable variableName="sfOrder" value="#[payload[0] default {}]" doc:name="sfOrder"/>
+
+                <!-- GATE — push to SAP only when the order is now Activated AND has
+                     not been synced yet. This is the intended trigger (activation)
+                     and simultaneously breaks the write-back loop: our write-back
+                     sets SAP_Sync_Status__c="Synced" (never touches Status), so its
+                     own UPDATE event lands here with Status=Activated but
+                     SAP_Sync_Status__c already set -> skipped. -->
+                <choice doc:name="Activated and not yet synced?">
+                    <when expression='#[((vars.sfOrder.Status default "") == "Activated") and (isEmpty(vars.sfOrder.SAP_Sync_Status__c default ""))]'>
+
+                        <logger level="INFO" message='#["[CDC] Order ACTIVATED " ++ vars.evt.recordId ++ " -> mapping lines + submitting to SAP"]' doc:name="log activated"/>
+                        <logger level="INFO" message='#["[CDC] enriched order: " ++ write(vars.sfOrder, "application/json")]' doc:name="log enriched"/>
+
+                        <!-- STEP 3 — map to the System API contract. Carry the SF
+                             OrderNumber as PO and one SAP line per Salesforce line
+                             item. Material, unit and plant come from config.yaml
+                             (sapMapping.*); dates and header fields fall to the
+                             System API defaults. -->
+                        <ee:transform doc:name="Build System API request">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var o    = vars.sfOrder
+var num  = (o.OrderNumber default (vars.evt.orderNumber default vars.evt.recordId)) as String
+// The child subquery may arrive as an array or as a {records:[...]} object.
+var oi   = o.OrderItems default []
+var recs = if (oi is Array) oi else (oi.records default [])
+// Mapping settings come from config.yaml (sapMapping.*).
+var demoMaterial = p("sapMapping.material") default ""
+var passPrefix   = p("sapMapping.passthroughPrefix") default ""
+var lines = recs map (it) -> {
+    // Material: products whose code starts with sapMapping.passthroughPrefix
+    // (e.g. "ZZ-INVALID") go to SAP unchanged, so SAP rejects them (422 ->
+    // Rejected). Everything else is ordered as sapMapping.material, or as its
+    // own ProductCode when that setting is "".
+    material: if ((passPrefix != "") and ((it.Product2.ProductCode default "") startsWith passPrefix))
+                  (it.Product2.ProductCode as String)
+              else if (demoMaterial != "") demoMaterial
+              else (it.Product2.ProductCode as String),
+    quantity: (round((it.Quantity default 1) as Number)) as String,
+    unit: p("sapMapping.unit"),
+    plant: p("sapMapping.plant"),
+    // Carry the real Salesforce product identity into SAP's "Customer Material
+    // Numb" column (CUST_MAT35 / KDMAT) — a passthrough that displays even
+    // when every line is ordered as the demo material. ProductCode + name, capped 35.
+    customerMaterial: (((it.Product2.ProductCode default "") ++
+        (if (isEmpty(it.Product2.Name default "")) "" else (" " ++ it.Product2.Name))) as String)[0 to 34] default ""
+}
+---
+{
+    poNumber: (("SF-" ++ num)[0 to 19]) default ("SF-" ++ num),
+    // No line items -> send none; the System API applies its own default line.
+    items: lines
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+
+                        <!-- DEBUG — confirm the SAP Customer Material (ProductCode + Name)
+                             is populated per line before POSTing to the System API.
+                             Remove once CUST_MAT35 is verified in SAP. -->
+                        <logger level="INFO" message='#[%dw 2.0
+output text/plain
+---
+"[CDC] SAP items for " ++ (vars.evt.recordId default "") ++ ": " ++ write(payload.items default [], "application/json")]' doc:name="log SAP items"/>
+
+                        <!-- STEP 4 — POST to the System API (accept all statuses so
+                             201/422/503 flow through instead of throwing on non-2xx). -->
+                        <try doc:name="Call System API">
+                            <http:request config-ref="SystemAPI_Request_config" method="POST" path="${systemApi.path}" doc:name="POST /api/salesorders">
+                                <http:body>#[output application/json --- payload]</http:body>
+                                <http:headers>#[{ "Content-Type": "application/json" }]</http:headers>
+                                <http:response-validator>
+                                    <http:success-status-code-validator values="100..599"/>
+                                </http:response-validator>
+                            </http:request>
+                            <set-variable variableName="apiStatus" value="#[attributes.statusCode]" doc:name="apiStatus"/>
+                            <set-variable variableName="apiBody" value="#[payload default {}]" doc:name="apiBody"/>
+                            <logger level="INFO" message='#["[CDC] System API status " ++ (vars.apiStatus as String) ++ " for " ++ vars.evt.recordId]' doc:name="log api status"/>
+
+                            <error-handler>
+                                <on-error-continue type="ANY" doc:name="System API unreachable">
+                                    <set-variable variableName="apiStatus" value="#[503]" doc:name="503"/>
+                                    <set-variable variableName="apiBody" value='#[{ error: "SYSTEM_API_UNAVAILABLE", message: (error.description default "") }]' doc:name="apiBody"/>
+                                    <logger level="ERROR" message='#["[CDC] System API unreachable for " ++ vars.evt.recordId ++ ": " ++ (error.description default "")]' doc:name="log unreachable"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+
+                        <!-- STEP 5 — write the SAP result back onto the Order record.
+                             201 -> Synced (+ SAP doc no.), 422 -> Rejected, else -> Failed.
+                             This UPDATE emits another OrderChangeEvent, harmlessly
+                             skipped by the gate above (SAP_Sync_Status__c now set). -->
+                        <ee:transform doc:name="Build write-back">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+var st   = vars.apiStatus default 503
+var body = vars.apiBody default {}
+var status = if (st == 201) "Synced" else if (st == 422) "Rejected" else "Failed"
+var msg = if (st == 201) ("SAP sales document " ++ (body.salesDocument default ""))
+          else if (st == 422) (write((body.validationMessages default body.submissionMessages default []), "application/json"))
+          else ((body.message default "SAP / System API unavailable") as String)
+---
+[
+    {
+        Id: vars.evt.recordId,
+        SAP_Sync_Status__c: status,
+        SAP_Sales_Document__c: (body.salesDocument default ""),
+        SAP_Sync_Message__c: (msg[0 to 1999] default msg)
+    }
+]]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                        <salesforce:update type="Order" config-ref="Salesforce_Config" doc:name="Write result back to Order"/>
+                        <logger level="INFO" message='#["[CDC] wrote back status for " ++ vars.evt.recordId ++ ": " ++ (vars.apiStatus as String)]' doc:name="log writeback"/>
+
+                    </when>
+                    <otherwise>
+                        <logger level="INFO" message='#["[CDC] skipping " ++ vars.evt.recordId ++ ": Status=" ++ (vars.sfOrder.Status default "?") ++ " SAP_Sync_Status=" ++ (vars.sfOrder.SAP_Sync_Status__c default "(blank)") ++ " (only Activated + unsynced orders push to SAP)"]' doc:name="skip not-activated"/>
+                    </otherwise>
+                </choice>
+
+            </when>
+            <otherwise>
+                <logger level="INFO" message='#["[CDC] ignoring " ++ vars.evt.changeType ++ " event (only CREATE/UPDATE are inspected)"]' doc:name="skip other"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+</mule>

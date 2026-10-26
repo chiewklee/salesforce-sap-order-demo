@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit" xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools  http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+	<munit:config name="sap-order-system-api-test-suite.xml" />
+
+	<!-- =====================================================================
+	     POST /api/salesorders — HAPPY PATH (validate OK -> submit -> commit)
+	     Mocks: validate returns no E rows; submit returns a SALESDOCUMENT;
+	     commit returns cleanly. Expect vars.httpStatus 201 and the doc number.
+	     ===================================================================== -->
+	<munit:test name="create-salesorder-201-happy-path"
+		description="Validate passes, order is created and committed -> 201 with salesDocument">
+		<munit:behavior>
+			<!-- STEP 1: validate (TESTRUN) returns only a success row -->
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Validate Sales Order (BAPI TESTRUN)" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { BAPI_SALESORDER_CREATEFROMDAT2: { tables: { RETURN: { row: { TYPE: 'S', ID: 'V1', NUMBER: '311', MESSAGE: 'Order is complete (TESTRUN)' } } } } }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<!-- STEP 2: real submit returns the created sales-document number -->
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Submit Sales Order (BAPI)" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { BAPI_SALESORDER_CREATEFROMDAT2: { export: { SALESDOCUMENT: '0000126098' }, tables: { RETURN: { row: { TYPE: 'S', ID: 'V1', NUMBER: '311', MESSAGE: 'Standard Order 126098 has been saved' } } } } }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<!-- COMMIT: succeeds -->
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="key" whereValue="BAPI_TRANSACTION_COMMIT" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { BAPI_TRANSACTION_COMMIT: {} }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event>
+				<munit:payload value="#[{ poNumber: 'SF-TEST-210', soldTo: '0000099999', items: [ { itemNo: '000010', material: 'B-7000', plant: '1000', quantity: '10', unit: 'ST', customerMaterial: 'SKU-1001 Sample Product A' }, { quantity: '3' } ] }]" />
+			</munit:set-event>
+			<flow-ref name="create-salesorder-flow" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo(201)]" message="Expected HTTP 201 on a clean create" />
+			<munit-tools:assert-that expression="#[payload.validated]" is="#[MunitTools::equalTo(true)]" message="validated should be true" />
+			<munit-tools:assert-that expression="#[payload.submitted]" is="#[MunitTools::equalTo(true)]" message="submitted should be true" />
+			<munit-tools:assert-that expression="#[payload.salesDocument]" is="#[MunitTools::equalTo('0000126098')]" message="salesDocument should echo SAP's doc number" />
+			<!-- validate + submit + commit each fired exactly once -->
+			<munit-tools:verify-call processor="sap:synchronous-remote-function-call" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Submit Sales Order (BAPI)" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call processor="sap:synchronous-remote-function-call" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="key" whereValue="BAPI_TRANSACTION_COMMIT" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<!-- =====================================================================
+	     POST /api/salesorders — REJECTION (validate returns an E message)
+	     Expect 422, nothing submitted, and the submit BAPI never called.
+	     ===================================================================== -->
+	<munit:test name="create-salesorder-422-validation-rejected"
+		description="An SAP E message on validate -> 422, submit is never called">
+		<munit:behavior>
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Validate Sales Order (BAPI TESTRUN)" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { BAPI_SALESORDER_CREATEFROMDAT2: { tables: { RETURN: { row: { TYPE: 'E', ID: 'V1', NUMBER: '382', MESSAGE: 'Material ZZ-INVALID is not defined for sales org.1000, distr.chan.10, language DE' } } } } }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event>
+				<munit:payload value="#[{ poNumber: 'SF-TEST-REJECT', items: [ { material: 'ZZ-INVALID', quantity: '1', unit: 'ST', plant: '1000' } ] }]" />
+			</munit:set-event>
+			<flow-ref name="create-salesorder-flow" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo(422)]" message="Business rejection must be 422" />
+			<munit-tools:assert-that expression="#[payload.validated]" is="#[MunitTools::equalTo(false)]" message="validated should be false" />
+			<munit-tools:assert-that expression="#[payload.submitted]" is="#[MunitTools::equalTo(false)]" message="submitted should be false" />
+			<munit-tools:assert-that expression="#[payload.salesDocument]" is="#[MunitTools::equalTo('')]" message="no sales document on rejection" />
+			<munit-tools:assert-that expression="#[payload.validationMessages[0].messageType]" is="#[MunitTools::equalTo('E')]" message="the E message should be surfaced" />
+			<!-- the submit BAPI must NOT have been called -->
+			<munit-tools:verify-call processor="sap:synchronous-remote-function-call" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Submit Sales Order (BAPI)" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<!-- =====================================================================
+	     GET /ping — RFC_PING connectivity probe returns the OK envelope
+	     ===================================================================== -->
+	<munit:test name="ping-returns-ok"
+		description="RFC_PING succeeds -> status OK envelope">
+		<munit:behavior>
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="key" whereValue="RFC_PING" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { RFC_PING: {} }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<flow-ref name="sap-ping-flow" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('OK')]" message="ping should report OK" />
+			<munit-tools:assert-that expression="#[payload.app]" is="#[MunitTools::equalTo('sap-order-system-api')]" message="app name in the envelope" />
+		</munit:validation>
+	</munit:test>
+
+	<!-- =====================================================================
+	     GET /api/salesorders/{id} — BAPI_SALESORDER_GETSTATUS read
+	     Mock returns one STATUSINFO row; assert it is surfaced.
+	     ===================================================================== -->
+	<munit:test name="get-salesorder-status-returns-items"
+		description="GETSTATUS returns header/item status for a document id">
+		<munit:behavior>
+			<munit-tools:mock-when processor="sap:synchronous-remote-function-call">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="key" whereValue="BAPI_SALESORDER_GETSTATUS" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[%dw 2.0 output application/xml --- { BAPI_SALESORDER_GETSTATUS: { tables: { STATUSINFO: { row: { DOC_NUMBER: '0000126063', PURCH_NO_C: 'SF-00000204', ITM_NUMBER: '000010', MATERIAL: 'B-7000', SHORT_TEXT: 'Brochure: New high tech range', REQ_QTY: '10.000', SALES_UNIT: 'ST', DLV_STAT_I: 'A' } }, RETURN: { row: { TYPE: 'S', MESSAGE: 'ok' } } } } }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event>
+				<munit:attributes value="#[{ uriParams: { salesDoc: '126063' }, method: 'GET' }]" />
+			</munit:set-event>
+			<flow-ref name="get-salesorder-flow" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that expression="#[payload.salesDocument]" is="#[MunitTools::equalTo('126063')]" message="echoes the requested id" />
+			<munit-tools:assert-that expression="#[sizeOf(payload.statusInfo)]" is="#[MunitTools::equalTo(1)]" message="one status row surfaced" />
+			<munit-tools:assert-that expression="#[payload.statusInfo[0].MATERIAL]" is="#[MunitTools::equalTo('B-7000')]" message="item material passed through" />
+		</munit:validation>
+	</munit:test>
+
+</mule>
